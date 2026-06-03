@@ -47,7 +47,7 @@ jobs:
         run: |
           sudo mkdir -p /opt/camoufox
           sudo chown "$USER:$USER" /opt/camoufox
-          echo "✓ Directory created"
+          echo "Directory created"
 
       - name: 3. Cache Camoufox & venv
         uses: actions/cache@v4
@@ -62,23 +62,21 @@ jobs:
       - name: 4. Install Python deps
         working-directory: /opt/camoufox
         run: |
-          # System libraries
           sudo apt-get update -qq 2>/dev/null || true
           sudo apt-get install -y --no-install-recommends \
               libgtk-3-0 libxt6 libdbus-glib-1-2 libpci3 \
               libxss1 libnss3 libasound2t64 fonts-liberation 2>/dev/null || true
 
-          # Python venv
           if [ ! -d venv ]; then
               python3 -m venv venv
               ./venv/bin/pip install -q --upgrade pip
               ./venv/bin/pip install -q camoufox aiohttp
-              echo "✓ Created new venv"
+              echo "Created new venv"
           else
-              echo "✓ Using cached venv"
+              echo "Using cached venv"
           fi
 
-      - name: 5. Fetch Camoufox (with retries)
+      - name: 5. Fetch Camoufox
         working-directory: /opt/camoufox
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,7 +84,7 @@ jobs:
           for attempt in 1 2 3; do
               echo "Attempt $attempt/3..."
               if ./venv/bin/python -m camoufox fetch 2>&1; then
-                  echo "✓ Success"
+                  echo "Success"
                   exit 0
               fi
               if [ $attempt -lt 3 ]; then
@@ -94,15 +92,13 @@ jobs:
                   sleep 30
               fi
           done
-          echo "✗ All attempts failed"
           exit 1
 
-      - name: 6. Create generator script
+      - name: 6. Create generator
         working-directory: /opt/camoufox
         run: |
-          cat > generator.py << 'GENERATOR_EOF'
+          python3 << 'PYSCRIPT'
 import asyncio
-import time
 import aiohttp
 from camoufox.async_api import AsyncCamoufox
 
@@ -112,8 +108,6 @@ SITEKEY = "0x4AAAAAAAABBPKA"
 
 NUM_BROWSERS = 1
 NUM_TABS = 6
-NUM_LANES = 5
-LANE_STAGGER_MS = 500
 BROWSER_LIFETIME_MS = 50 * 60_000
 
 _level_counts = {"0": 0, "1": 0, "other": 0}
@@ -145,9 +139,7 @@ async def setup_tab(page, tab_id, session):
                 _level_counts[level] += 1
             else:
                 _level_counts["other"] += 1
-            short = token[:24] + "..." + token[-12:] if len(token) > 36 else token
-            totals = f"L1:{_level_counts['1']} L0:{_level_counts['0']}"
-            print(f"[tab {tab_id}] {short} | {totals}")
+            print(f"[tab {tab_id}] Token | L1:{_level_counts['1']} L0:{_level_counts['0']}")
             asyncio.create_task(_post_token(session, token))
 
     page.on("console", on_console)
@@ -157,13 +149,8 @@ async def setup_tab(page, tab_id, session):
         await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
     except:
         pass
-
+    
     await asyncio.sleep(0.5)
-
-    try:
-        await page.goto(TARGET_URL, wait_until="load", timeout=30000)
-    except:
-        pass
 
     async def reload_loop():
         while not page.is_closed():
@@ -193,7 +180,7 @@ async def run_browser(browser_num, session):
                     if i < NUM_TABS - 1:
                         await asyncio.sleep(2)
                 await asyncio.sleep(BROWSER_LIFETIME_MS / 1000)
-                print(f"[browser {browser_num}] lifetime reached, recycling...")
+                print(f"[browser {browser_num}] recycling...")
         except Exception as e:
             print(f"[browser {browser_num}] error: {e}")
             await asyncio.sleep(5)
@@ -207,8 +194,8 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-GENERATOR_EOF
-          echo "✓ Generator created"
+PYSCRIPT
+          echo "Generator created"
 
       - name: 7. Run generator
         working-directory: /opt/camoufox
@@ -216,4 +203,101 @@ GENERATOR_EOF
         run: |
           sudo renice -n -20 -p $$ >/dev/null 2>&1 || true
           sudo ionice -c 1 -n 0 -p $$ >/dev/null 2>&1 || true
-          ./venv/bin/python generator.py
+          python3 << 'PYSCRIPT'
+import asyncio
+import aiohttp
+from camoufox.async_api import AsyncCamoufox
+
+MOONFIIVE_URL = "https://lm9wd.alwaysdata.net/add-token"
+TARGET_URL = "https://gartic.io"
+SITEKEY = "0x4AAAAAAAABBPKA"
+
+NUM_BROWSERS = 1
+NUM_TABS = 6
+BROWSER_LIFETIME_MS = 50 * 60_000
+
+_level_counts = {"0": 0, "1": 0, "other": 0}
+
+async def _post_token(session, token):
+    try:
+        async with session.post(MOONFIIVE_URL, json={"token": token}) as resp:
+            await resp.read()
+    except:
+        pass
+
+async def _route_handler(route):
+    request = route.request
+    if request.resource_type == "document":
+        await route.continue_()
+        return
+    if "challenges.cloudflare.com" in request.url:
+        await route.continue_()
+        return
+    await route.abort()
+
+async def setup_tab(page, tab_id, session):
+    def on_console(msg):
+        text = msg.text
+        if text.startswith("T:"):
+            token = text[2:]
+            level = token[0] if token and token[1:2] == "." else "other"
+            if level in _level_counts:
+                _level_counts[level] += 1
+            else:
+                _level_counts["other"] += 1
+            print(f"[tab {tab_id}] Token | L1:{_level_counts['1']} L0:{_level_counts['0']}")
+            asyncio.create_task(_post_token(session, token))
+
+    page.on("console", on_console)
+    await page.route("**/*", _route_handler)
+
+    try:
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+    except:
+        pass
+    
+    await asyncio.sleep(0.5)
+
+    async def reload_loop():
+        while not page.is_closed():
+            await asyncio.sleep(3600)
+            if page.is_closed():
+                return
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+            except:
+                pass
+
+    asyncio.create_task(reload_loop())
+
+async def run_browser(browser_num, session):
+    while True:
+        try:
+            print(f"[browser {browser_num}] launching...")
+            async with AsyncCamoufox(
+                headless=True,
+                disable_coop=True,
+                humanize=False,
+            ) as browser:
+                for i in range(NUM_TABS):
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    asyncio.create_task(setup_tab(page, f"{browser_num}.{i+1}", session))
+                    if i < NUM_TABS - 1:
+                        await asyncio.sleep(2)
+                await asyncio.sleep(BROWSER_LIFETIME_MS / 1000)
+                print(f"[browser {browser_num}] recycling...")
+        except Exception as e:
+            print(f"[browser {browser_num}] error: {e}")
+            await asyncio.sleep(5)
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for b in range(NUM_BROWSERS):
+            tasks.append(asyncio.create_task(run_browser(b + 1, session)))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+PYSCRIPT
