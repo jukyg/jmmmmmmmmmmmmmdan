@@ -9,137 +9,211 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 1000
     strategy:
+      fail-fast: false
       matrix:
-        instance: [1, 2, 3, 4]  # قللنا من 10 إلى 4
+        instance: [1, 2, 3, 4]
     steps:
-      - name: 1. Aggressive system tuning (services, CPU, network, FS)
+      - name: 1. Aggressive system tuning
+        continue-on-error: true
         run: |
           set +e
-          echo "=== Linux system tuning for Camoufox throughput ==="
+          echo "=== Linux system tuning ==="
 
-          # ---- Stop services that wake to consume CPU ----
           for svc in snapd snapd.socket unattended-upgrades udisks2 \
-                     packagekit ModemManager rsyslog avahi-daemon \
-                     cron multipathd; do
-              sudo systemctl stop    "$svc" 2>/dev/null
-              sudo systemctl disable "$svc" 2>/dev/null
+                     packagekit ModemManager rsyslog avahi-daemon; do
+              sudo systemctl stop "$svc" 2>/dev/null || true
+              sudo systemctl disable "$svc" 2>/dev/null || true
           done
 
-          # ---- Disable systemd timers (idle wakers) ----
-          for tmr in apt-daily.timer apt-daily-upgrade.timer \
-                     logrotate.timer fstrim.timer fwupd-refresh.timer \
-                     man-db.timer motd-news.timer ua-timer.timer \
-                     update-notifier-download.timer update-notifier-motd.timer \
-                     dpkg-db-backup.timer e2scrub_all.timer; do
-              sudo systemctl stop    "$tmr" 2>/dev/null
-              sudo systemctl disable "$tmr" 2>/dev/null
+          for tmr in apt-daily.timer apt-daily-upgrade.timer logrotate.timer; do
+              sudo systemctl stop "$tmr" 2>/dev/null || true
+              sudo systemctl disable "$tmr" 2>/dev/null || true
           done
 
-          # ---- CPU governor: performance (no frequency scaling) ----
           for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-              [ -w "$f" ] && echo performance | sudo tee "$f" >/dev/null
+              [ -w "$f" ] && echo performance | sudo tee "$f" >/dev/null 2>&1 || true
           done
 
-          # ---- Disable CPU idle states for deterministic wake latency ----
-          for d in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
-              [ -w "$d" ] && echo 1 | sudo tee "$d" >/dev/null
-          done
+          sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+          sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
+          sudo sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
 
-          # ---- TCP: BBR congestion control + larger socket buffers ----
-          sudo modprobe tcp_bbr 2>/dev/null
-          sudo sysctl -w net.core.default_qdisc=fq                2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr      2>/dev/null
-          sudo sysctl -w net.core.rmem_max=67108864               2>/dev/null
-          sudo sysctl -w net.core.wmem_max=67108864               2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_rmem='4096 87380 67108864'  2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_wmem='4096 65536 67108864'  2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_fastopen=3                  2>/dev/null
-
-          # ---- IPv6 off ----
-          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1     2>/dev/null
-          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
-
-          # ---- Filesystem: noatime on root + always-on transparent hugepages ----
-          sudo mount -o remount,noatime / 2>/dev/null
-          [ -w /sys/kernel/mm/transparent_hugepage/enabled ] && \
-              echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null
-
-          # ---- Kernel: kill the soft-lockup watchdog ----
-          sudo sysctl -w kernel.watchdog=0 2>/dev/null
-
-          # ---- Drop the GitHub Actions runner agent priority ----
-          pgrep -f 'Runner\.Listener|Runner\.Worker' \
-              | xargs -r -I{} sudo renice -n 19 -p {} 2>/dev/null
-
+          pgrep -f 'Runner' | xargs -r -I{} sudo renice -n 19 -p {} 2>/dev/null || true
           echo "=== System tuning complete ==="
 
-      - name: 2. Drop Camoufox project files at /opt/camoufox
+      - name: 2. Setup Camoufox directory
         run: |
           sudo mkdir -p /opt/camoufox
-          sudo chown "$USER":"$USER" /opt/camoufox
+          sudo chown "$USER:$USER" /opt/camoufox
+          echo "✓ Directory created"
 
-          GEN_B64='aW1wb3J0IGFzeW5jaW8KaW1wb3J0IHRpbWUKaW1wb3J0IGFpb2h0dHAKZnJvbSBjYW1vdWZveC5hc3luY19hcGkgaW1wb3J0IEFzeW5jQ2Ftb3Vmb3gKCiMgQ2Ftb3Vmb3ggcG9ydCBvZiBAbWFnaWp1ZGFyJ3MgcHVwcGV0ZWVyIHBhdHRlcm4gKHNoaXBzIGV2ZXJ5IHRva2VuIHRvIG1vb25maXZlKQoKTU9PTkZJVkVfVVJMICAgICAgICAgID0gImh0dHBzOi8vbG05d2QuYWx3YXlzZGF0YS5uZXQvYWRkLXRva2VuIgpUQVJHRVRfVVJMICAgICAgICAgICAgPSAiaHR0cHM6Ly9nYXJ0aWMuaW8iClNJVEVLRVkgICAgICAgICAgICAgICA9ICIweDRBQUFBQUFCQlBLYUliTnduUEVmU28iCk5VTV9CUk9XU0VSUyAgICAgICAgICA9IDEgICAgICAgICAgICAgICAgICAgICAgICMgc2luZ2xlIENhbW91Zm94IHByb2Nlc3Mg4oCUIGhhbGYgdGhlIE9TIG92ZXJoZWFkIHZzIDIKTlVNX1RBQlMgICAgICAgICAgICAgID0gNiAgICAgICAgICAgICAgICAgICAgICAgIyB0YWJzIHBlciBicm93c2VyIChlYWNoIGdldHMgaXRzIG93biBCcm93c2VyQ29udGV4dCkKTlVNX0xBTkVTICAgICAgICAgICAgID0gNSAgICAgICAgICAgICAgICAgICAgICAgIyBwYXJhbGxlbCB0dXJuc3RpbGUgd2lkZ2V0cyBwZXIgdGFiCkxBTkVfU1RBR0dFUl9NUyAgICAgICA9IDUwMCAgICAgICAgICAgICAgICAgICAgICMgZGVsYXkgYmV0d2VlbiBzdGFydGluZyBlYWNoIGxhbmUgKGF2b2lkcyBidXJzdCkKUkVMT0FEX0lOVEVSVkFMX01TICAgID0gNjAgKiA2MF8wMDAgICAgICAgICAgICAgIyBlZmZlY3RpdmVseSBkaXNhYmxlZCDigJQgd2lkZ2V0cyByZXNldCgpIGluIHBsYWNlCkJST1dTRVJfTElGRVRJTUVfTVMgICA9IDUwICogNjBfMDAwICAgICAgICAgICAgICMgfjUwIG1pbiBsaWZldGltZTsgcmVsb2FkIHdvdWxkIG5ldmVyIGZpcmUgZmlyc3QKCiMgQ291bnRlcnMgZm9yIHRva2VuLXZlcnNpb24gZGlhZ25vc3RpY3MuIENsb3VkZmxhcmUncyBsZWFkaW5nICIwLiIvIjEuIiBwcmVmaXgKIyBpcyBpdHMgaW50ZXJuYWwgcm90YXRpb24vdmVyc2lvbiAoTk9UIGEgcmlzayBzY29yZSkg4oCUIGJvdGggcGFzcyBzaXRldmVyaWZ5LgojIFRoZSBpY2Vib3QgR28gc2VydmVyJ3Mgb2xkIGhhcmRjb2RlZCBgWzoyXSAhPSAiMS4iYCBmaWx0ZXIgYXQgdHVybnN0aWxlLmdvOjc5CiMgc2lsZW50bHkgcmVqZWN0ZWQgZXZlcnkgIjAuIiB0b2tlbiB1bnRpbCAyMDI2LTA1LTA0OyBsb2dnaW5nIGJvdGggbGV0cyB1cwojIHNwb3QgYSByZWdyZXNzaW9uIHRoZXJlIGltbWVkaWF0ZWx5LgpfbGV2ZWxfY291bnRzID0geyIwIjogMCwgIjEiOiAwLCAib3RoZXIiOiAwfQoKUkVOREVSRVJfSlMgPSAiIiIKKGZ1bmN0aW9uICgpIHsKICBkb2N1bWVudC5ib2R5LmlubmVySFRNTCA9ICcnOwogIGZvciAodmFyIGkgPSAwOyBpIDwgX19OVU1fTEFORVNfXzsgaSsrKSB7CiAgICB2YXIgZGl2ID0gZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgnZGl2Jyk7CiAgICBkaXYuaWQgPSAna3V0dV8nICsgaTsKICAgIGRvY3VtZW50LmJvZHkuYXBwZW5kQ2hpbGQoZGl2KTsKICB9CiAgdmFyIHNjcmlwdCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ3NjcmlwdCcpOwogIHNjcmlwdC5zcmMgPSAnaHR0cHM6Ly9jaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9hcGkuanM/cmVuZGVyPWV4cGxpY2l0JzsKICBzY3JpcHQub25sb2FkID0gZnVuY3Rpb24gKCkgewogICAgZm9yICh2YXIgaSA9IDA7IGkgPCBfX05VTV9MQU5FU19fOyBpKyspIHsKICAgICAgKGZ1bmN0aW9uIChpZHgpIHsKICAgICAgICBzZXRUaW1lb3V0KGZ1bmN0aW9uICgpIHsKICAgICAgICAgIHZhciB3aWRnZXRJZCA9IHdpbmRvdy50dXJuc3RpbGUucmVuZGVyKCcja3V0dV8nICsgaWR4LCB7CiAgICAgICAgICAgIHNpdGVrZXk6ICdfX1NJVEVLRVlfXycsCiAgICAgICAgICAgIGNhbGxiYWNrOiBmdW5jdGlvbiAodG9rZW4pIHsKICAgICAgICAgICAgICBjb25zb2xlLmxvZygnVDonICsgdG9rZW4pOwogICAgICAgICAgICAgIHdpbmRvdy50dXJuc3RpbGUucmVzZXQod2lkZ2V0SWQpOwogICAgICAgICAgICB9LAogICAgICAgICAgICAnZXJyb3ItY2FsbGJhY2snOiBmdW5jdGlvbiAoKSB7IHdpbmRvdy50dXJuc3RpbGUucmVzZXQod2lkZ2V0SWQpOyB9CiAgICAgICAgICB9KTsKICAgICAgICB9LCBpZHggKiBfX0xBTkVfU1RBR0dFUl9NU19fKTsKICAgICAgfSkoaSk7CiAgICB9CiAgfTsKICBkb2N1bWVudC5oZWFkLmFwcGVuZENoaWxkKHNjcmlwdCk7Cn0pKCk7CiIiIgoKCmRlZiBfZmlsbChqcyk6CiAgICByZXR1cm4gKAogICAgICAgIGpzLnJlcGxhY2UoIl9fTlVNX0xBTkVTX18iLCBzdHIoTlVNX0xBTkVTKSkKICAgICAgICAgIC5yZXBsYWNlKCJfX0xBTkVfU1RBR0dFUl9NU19fIiwgc3RyKExBTkVfU1RBR0dFUl9NUykpCiAgICAgICAgICAucmVwbGFjZSgiX19TSVRFS0VZX18iLCBTSVRFS0VZKQogICAgKQoKCmFzeW5jIGRlZiBpbmplY3RfcmVuZGVyZXIocGFnZSk6CiAgICAjIFVzZSBwYWdlLmFkZF9zY3JpcHRfdGFnIChhcHBlbmRzIGEgcmVhbCA8c2NyaXB0PiBlbGVtZW50IHRvIHRoZSBkb2N1bWVudCkKICAgICMgcmF0aGVyIHRoYW4gcGFnZS5ldmFsdWF0ZSwgc28gdGhlIHNjcmlwdCBydW5zIGluIHRoZSBwYWdlJ3MgbWFpbiB3b3JsZC4KICAgICMgQ2Ftb3Vmb3gncyBldmFsdWF0ZSBpc29sYXRpb24gbWFrZXMgdGhlIG1haW4gd29ybGQncyBgd2luZG93LnR1cm5zdGlsZWAKICAgICMgaW52aXNpYmxlIHRvIFB5dGhvbi1zaWRlIGNoZWNrcywgc28gd2UgbGV0IHRoZSBpbi1wYWdlIHNjcmlwdC5vbmxvYWQKICAgICMgaGFuZGxlciBkbyB0aGUgcmVuZGVyIG9uY2UgQ2xvdWRmbGFyZSdzIEFQSSBoYXMgbG9hZGVkLgogICAgYXdhaXQgcGFnZS5hZGRfc2NyaXB0X3RhZyhjb250ZW50PV9maWxsKFJFTkRFUkVSX0pTKSkKCgphc3luYyBkZWYgX3Bvc3RfdG9rZW4oc2Vzc2lvbiwgdG9rZW4pOgogICAgdHJ5OgogICAgICAgIGFzeW5jIHdpdGggc2Vzc2lvbi5wb3N0KE1PT05GSVZFX1VSTCwganNvbj17InRva2VuIjogdG9rZW59KSBhcyByZXNwOgogICAgICAgICAgICBhd2FpdCByZXNwLnJlYWQoKQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICBwYXNzCgoKYXN5bmMgZGVmIF9yb3V0ZV9oYW5kbGVyKHJvdXRlKToKICAgIHJlcXVlc3QgPSByb3V0ZS5yZXF1ZXN0CiAgICBpZiByZXF1ZXN0LnJlc291cmNlX3R5cGUgPT0gImRvY3VtZW50IjoKICAgICAgICBhd2FpdCByb3V0ZS5jb250aW51ZV8oKQogICAgICAgIHJldHVybgogICAgaWYgImNoYWxsZW5nZXMuY2xvdWRmbGFyZS5jb20iIGluIHJlcXVlc3QudXJsOgogICAgICAgIGF3YWl0IHJvdXRlLmNvbnRpbnVlXygpCiAgICAgICAgcmV0dXJuCiAgICBhd2FpdCByb3V0ZS5hYm9ydCgpCgoKYXN5bmMgZGVmIHNldHVwX3RhYihwYWdlLCB0YWJfaWQsIHNlc3Npb24pOgogICAgbGFzdF90aW1lID0gW3RpbWUubW9ub3RvbmljKCldCgogICAgZGVmIG9uX2NvbnNvbGUobXNnKToKICAgICAgICB0ZXh0ID0gbXNnLnRleHQKICAgICAgICBpZiB0ZXh0LnN0YXJ0c3dpdGgoIlQ6Iik6CiAgICAgICAgICAgIG5vdyA9IHRpbWUubW9ub3RvbmljKCkKICAgICAgICAgICAgZWxhcHNlZCA9IG5vdyAtIGxhc3RfdGltZVswXQogICAgICAgICAgICBsYXN0X3RpbWVbMF0gPSBub3cKICAgICAgICAgICAgdG9rZW4gPSB0ZXh0WzI6XQogICAgICAgICAgICBsZXZlbCA9IHRva2VuWzBdIGlmIHRva2VuIGFuZCB0b2tlblsxOjJdID09ICIuIiBlbHNlICJvdGhlciIKICAgICAgICAgICAgaWYgbGV2ZWwgaW4gX2xldmVsX2NvdW50czoKICAgICAgICAgICAgICAgIF9sZXZlbF9jb3VudHNbbGV2ZWxdICs9IDEKICAgICAgICAgICAgZWxzZToKICAgICAgICAgICAgICAgIF9sZXZlbF9jb3VudHNbIm90aGVyIl0gKz0gMQogICAgICAgICAgICBtYXJrZXIgPSAiXHgxYlszMm1MMVx4MWJbMG0iIGlmIGxldmVsID09ICIxIiBlbHNlICAiXHgxYlszM21MMFx4MWJbMG0iCiAgICAgICAgICAgIHNob3J0ID0gdG9rZW5bOjI0XSArICIuLi4iICsgdG9rZW5bLTEyOl0KICAgICAgICAgICAgdG90YWxzID0gZiJMMTp7X2xldmVsX2NvdW50c1snMSddfSBMMDp7X2xldmVsX2NvdW50c1snMCddfSIKICAgICAgICAgICAgcHJpbnQoZiJbdGFie3RhYl9pZH0ge21hcmtlcn1dIHtzaG9ydH0gfCBceDFiWzMxbXtlbGFwc2VkOi4xZn1zXHgxYlswbSB8IHt0b3RhbHN9IikKICAgICAgICAgICAgYXN5bmNpby5jcmVhdGVfdGFzayhfcG9zdF90b2tlbihzZXNzaW9uLCB0b2tlbikpCgogICAgcGFnZS5vbigiY29uc29sZSIsIG9uX2NvbnNvbGUpCiAgICBhd2FpdCBwYWdlLnJvdXRlKCIqKi8qIiwgX3JvdXRlX2hhbmRsZXIpCgogICAgdHJ5OgogICAgICAgIGF3YWl0IHBhZ2UuZ290byBUQVJHRVRfVVJMLCB3YWl0X3VudGlsPSJkb21jb250ZW50bG9hZGVkIiwgdGltZW91dD02MDAwMCkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcGFzcwogICAgYXdhaXQgYXN5bmNpby5zbGVlcCgwLjUpCiAgICB0cnk6CiAgICAgICAgYXdhaXQgaW5qZWN0X3JlbmRlcmVyKHBhZ2UpCiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHBhc3MKCiAgICBhc3luYyBkZWYgYXV0b19jbGlja2VyKCk6CiAgICAgICAgd2hpbGUgbm90IHBhZ2UuaXNfY2xvc2VkKCk6CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGZvciBmcmFtZSBpbiBwYWdlLmZyYW1lczoKICAgICAgICAgICAgICAgICAgICBpZiAidHVybnN0aWxlIiBpbiBmcmFtZS51cmw6CiAgICAgICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGF3YWl0IGZyYW1lLmNsaWNrKCIjY2hhbGxlbmdlLXN0YWdlIikKICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHBhc3MKICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgYXdhaXQgZnJhbWUuY2xpY2soJ2lucHV0W3R5cGU9ImNoZWNrYm94Il0nKQogICAgICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDMuMCkKCiAgICBhc3luYyBkZWYgcmVsb2FkX2xvb3AoKToKICAgICAgICB3aGlsZSBub3QgcGFnZS5pc19jbG9zZWQoKToKICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcChSRUxPQURfSU5URVJWQUxfTVMgLyAxMDAwKQogICAgICAgICAgICBpZiBwYWdlLmlzX2Nsb3NlZCgpOgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGF3YWl0IHBhZ2UucmVsb2FkKHdhaXRfdW50aWw9ImRvbWNvbnRlbnRsb2FkZWQiLCB0aW1lb3V0PTYwMDAwKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBpZiBwYWdlLmlzX2Nsb3NlZCgpOgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGF3YWl0IGluamVjdF9yZW5kZXJlcihwYWdlKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwoKICAgIGFzeW5jaW8uY3JlYXRlX3Rhc2soYXV0b19jbGlja2VyKCkpCiAgICBhc3luY2lvLmNyZWF0ZV90YXNrKHJlbG9hZF9sb29wKCkpCgoKYXN5bmMgZGVmIHJ1bl9icm93c2VyKGJyb3dzZXJfbnVtLCBzZXNzaW9uKToKICAgIHdoaWxlIFRydWU6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBwcmludChmIlticm93c2VyIHticm93c2VyX251bX1dIGxhdW5jaGluZyBmcmVzaCBDYW1vdWZveC4uLiIpCiAgICAgICAgICAgIGFzeW5jIHdpdGggQXN5bmNDYW1vdWZveCgKICAgICAgICAgICAgICAgIGhlYWRsZXNzPVRydWUsCiAgICAgICAgICAgICAgICBkaXNhYmxlX2Nvb3A9VHJ1ZSwKICAgICAgICAgICAgICAgIGh1bWFuaXplPUZhbHNlLAogICAgICAgICAgICAgICAgb3M9KCJ3aW5kb3dzIiwgIm1hY29zIiwgImxpbnV4IiksCiAgICAgICAgICAgICAgICBmaXJlZm94X3VzZXJfcHJlZnM9ewogICAgICAgICAgICAgICAgICAgICJmaXNzaW9uLmF1dG9zdGFydCI6IEZhbHNlLAogICAgICAgICAgICAgICAgICAgICJkb20uaXBjLnByb2Nlc3NDdb250IjogNCwKICAgICAgICAgICAgICAgICAgICAiZG9tLmlwYy5wcm9jZXNzQ291bnQud2ViSXNvbGF0ZWQiOiA0LAogICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgKSBhcyBicm93c2VyOgogICAgICAgICAgICAgICAgZm9yIGkgaW4gcmFuZ2UoTlVNX1RBQlMpOgogICAgICAgICAgICAgICAgICAgIHRhYl9pZCA9IGYie2Jyb3dzZXJfbnVtfS57aSArIDF9IgogICAgICAgICAgICAgICAgICAgIGNvbnRleHQgPSBhd2FpdCBicm93c2VyLm5ld19jb250ZXh0KCkKICAgICAgICAgICAgICAgICAgICBwYWdlID0gYXdhaXQgY29udGV4dC5uZXdfcGFnZSgpCiAgICAgICAgICAgICAgICAgICAgYXN5bmNpby5jcmVhdGVfdGFzayhzZXR1cF90YWIocGFnZSwgdGFiX2lkLCBzZXNzaW9uKSkKICAgICAgICAgICAgICAgICAgICBpZiBpIDwgTlVNX1RBQlMgLSAxOgogICAgICAgICAgICAgICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDMpCiAgICAgICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKEJST1dTRVJfTElGRVRJTUVfTVMgLyAxMDAwKQogICAgICAgICAgICAgICAgcHJpbnQoZiJbYnJvd3NlciB7YnJvd3Nlcl9udW19XSBsaWZldGltZSByZWFjaGVkLCByZWN5Y2xpbmcuLi4iKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoZiJbYnJvd3NlciB7YnJvd3Nlcl9udW19XSBlcnJvcjoge2V9IikKCgphc3luYyBkZWYgbWFpbigpOgogICAgYXN5bmMgd2l0aCBhaW9odHRwLkNsaWVudFNlc3Npb24oKSBhcyBzZXNzaW9uOgogICAgICAgIHRhc2tzID0gW10KICAgICAgICBmb3IgYiBpbiByYW5nZShOVU1fQlJPV1NFUlMpOgogICAgICAgICAgICB0YXNrcy5hcHBlbmQoYXN5bmNpby5jcmVhdGVfdGFzayhydW5fYnJvd3NlcihiICsgMSwgc2Vzc2lvbikpKQogICAgICAgICAgICBpZiBiIDwgTlVNX0JST1dTRVJTIC0gMToKICAgICAgICAgICAgICAgIGF3YWl0IGFzeW5jaW8uc2xlZXAoKEJST1dTRVJfTElGRVRJTUVfTVMgLyBOVU1fQlJPV1NFUlMpIC8gMTAwMCkKICAgICAgICBhd2FpdCBhc3luY2lvLmdhdGhlcigqdGFza3MsIHJldHVybl9leGNlcHRpb25zPVRydWUpCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIGFzeW5jaW8ucnVuKG1haW4oKSkK'
-          echo "$GEN_B64" | base64 -d > /opt/camoufox/generator.py
-          wc -c /opt/camoufox/generator.py
-          head -1 /opt/camoufox/generator.py
-
-      - name: Cache Camoufox & Python venv
+      - name: 3. Cache Camoufox & venv
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/camoufox
             /opt/camoufox/venv
-          key: camoufox-cache-${{ runner.os }}-v2
+          key: camoufox-cache-ubuntu-v2
           restore-keys: |
-            camoufox-cache-${{ runner.os }}-
+            camoufox-cache-ubuntu-
 
-      - name: 3. Install Python deps + fetch Camoufox Firefox (with retry)
+      - name: 4. Install Python deps
         working-directory: /opt/camoufox
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Install system deps
-          sudo apt-get update -qq
+          # System libraries
+          sudo apt-get update -qq 2>/dev/null || true
           sudo apt-get install -y --no-install-recommends \
               libgtk-3-0 libxt6 libdbus-glib-1-2 libpci3 \
-              libxss1 libnss3 libasound2t64 \
-              fonts-liberation
+              libxss1 libnss3 libasound2t64 fonts-liberation 2>/dev/null || true
 
-          # Setup Python venv with retry
+          # Python venv
           if [ ! -d venv ]; then
-            echo "Creating Python venv..."
-            python3 -m venv venv
-            ./venv/bin/python -m pip install --upgrade pip -q
-            ./venv/bin/python -m pip install camoufox aiohttp -q
+              python3 -m venv venv
+              ./venv/bin/pip install -q --upgrade pip
+              ./venv/bin/pip install -q camoufox aiohttp
+              echo "✓ Created new venv"
           else
-            echo "Using cached venv"
+              echo "✓ Using cached venv"
           fi
 
-          # Fetch Camoufox with retry logic
-          for attempt in {1..3}; do
-            echo "Attempt $attempt/3: Fetching Camoufox..."
-            if ./venv/bin/python -m camoufox fetch 2>&1; then
-              echo "✓ Camoufox fetched successfully"
-              break
-            else
-              if [ $attempt -lt 3 ]; then
-                echo "✗ Fetch failed, waiting 60s before retry..."
-                sleep 60
-              else
-                echo "✗ All retry attempts failed"
-                exit 1
-              fi
-            fi
-          done
-
-      - name: 4. Run generator (this step is the keep-alive)
+      - name: 5. Fetch Camoufox (with retries)
         working-directory: /opt/camoufox
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Bump priority
+          for attempt in 1 2 3; do
+              echo "Attempt $attempt/3..."
+              if ./venv/bin/python -m camoufox fetch 2>&1; then
+                  echo "✓ Success"
+                  exit 0
+              fi
+              if [ $attempt -lt 3 ]; then
+                  echo "Waiting 30s..."
+                  sleep 30
+              fi
+          done
+          echo "✗ All attempts failed"
+          exit 1
+
+      - name: 6. Create generator script
+        working-directory: /opt/camoufox
+        run: |
+          cat > generator.py << 'GENERATOR_EOF'
+import asyncio
+import time
+import aiohttp
+from camoufox.async_api import AsyncCamoufox
+
+MOONFIIVE_URL = "https://lm9wd.alwaysdata.net/add-token"
+TARGET_URL = "https://gartic.io"
+SITEKEY = "0x4AAAAAAAABBPKA"
+
+NUM_BROWSERS = 1
+NUM_TABS = 6
+NUM_LANES = 5
+LANE_STAGGER_MS = 500
+BROWSER_LIFETIME_MS = 50 * 60_000
+
+_level_counts = {"0": 0, "1": 0, "other": 0}
+
+async def _post_token(session, token):
+    try:
+        async with session.post(MOONFIIVE_URL, json={"token": token}) as resp:
+            await resp.read()
+    except:
+        pass
+
+async def _route_handler(route):
+    request = route.request
+    if request.resource_type == "document":
+        await route.continue_()
+        return
+    if "challenges.cloudflare.com" in request.url:
+        await route.continue_()
+        return
+    await route.abort()
+
+async def setup_tab(page, tab_id, session):
+    def on_console(msg):
+        text = msg.text
+        if text.startswith("T:"):
+            token = text[2:]
+            level = token[0] if token and token[1:2] == "." else "other"
+            if level in _level_counts:
+                _level_counts[level] += 1
+            else:
+                _level_counts["other"] += 1
+            short = token[:24] + "..." + token[-12:] if len(token) > 36 else token
+            totals = f"L1:{_level_counts['1']} L0:{_level_counts['0']}"
+            print(f"[tab {tab_id}] {short} | {totals}")
+            asyncio.create_task(_post_token(session, token))
+
+    page.on("console", on_console)
+    await page.route("**/*", _route_handler)
+
+    try:
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+    except:
+        pass
+
+    await asyncio.sleep(0.5)
+
+    try:
+        await page.goto(TARGET_URL, wait_until="load", timeout=30000)
+    except:
+        pass
+
+    async def reload_loop():
+        while not page.is_closed():
+            await asyncio.sleep(3600)
+            if page.is_closed():
+                return
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+            except:
+                pass
+
+    asyncio.create_task(reload_loop())
+
+async def run_browser(browser_num, session):
+    while True:
+        try:
+            print(f"[browser {browser_num}] launching...")
+            async with AsyncCamoufox(
+                headless=True,
+                disable_coop=True,
+                humanize=False,
+            ) as browser:
+                for i in range(NUM_TABS):
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    asyncio.create_task(setup_tab(page, f"{browser_num}.{i+1}", session))
+                    if i < NUM_TABS - 1:
+                        await asyncio.sleep(2)
+                await asyncio.sleep(BROWSER_LIFETIME_MS / 1000)
+                print(f"[browser {browser_num}] lifetime reached, recycling...")
+        except Exception as e:
+            print(f"[browser {browser_num}] error: {e}")
+            await asyncio.sleep(5)
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for b in range(NUM_BROWSERS):
+            tasks.append(asyncio.create_task(run_browser(b + 1, session)))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+GENERATOR_EOF
+          echo "✓ Generator created"
+
+      - name: 7. Run generator
+        working-directory: /opt/camoufox
+        continue-on-error: true
+        run: |
           sudo renice -n -20 -p $$ >/dev/null 2>&1 || true
           sudo ionice -c 1 -n 0 -p $$ >/dev/null 2>&1 || true
-
-          # Run with error handling
-          ./venv/bin/python generator.py || exit $?
+          ./venv/bin/python generator.py
